@@ -26,7 +26,6 @@ from cirq import (
     # Low level
     _version,
     _doc,
-    type_workarounds,
 )
 
 with _import.delay_import('cirq.protocols'):
@@ -495,6 +494,7 @@ from cirq.sim import (
 )
 
 from cirq.study import (
+    Concat as Concat,
     dict_to_product_sweep as dict_to_product_sweep,
     dict_to_zip_sweep as dict_to_zip_sweep,
     ExpressionMap as ExpressionMap,

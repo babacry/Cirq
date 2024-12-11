@@ -17,6 +17,8 @@ from typing import Iterator
 import pytest
 import sympy
 
+import tunits
+
 import cirq
 from cirq.study import sweeps
 from cirq_google.study import DeviceParameter
@@ -68,6 +70,7 @@ class UnknownSweep(sweeps.SingleSweep):
                 + (cirq.Points('g', [1, 2]) * cirq.Points('h', [-1, 0, 1]))
             )
         ),
+        cirq.ZipLongest(cirq.Points('a', [1.0, 2.0, 3.0]), cirq.Points('b', [1.0])),
         # Sweep with constant. Type ignore is because cirq.Points type annotated with floats.
         cirq.Points('a', [None]),  # type: ignore[list-item]
         cirq.Points('a', [None]) * cirq.Points('b', [1, 2, 3]),  # type: ignore[list-item]
@@ -79,6 +82,7 @@ class UnknownSweep(sweeps.SingleSweep):
             cirq.Points('a', [1]) * cirq.Points('b', [1.0])
             + cirq.Points('c', ["abc"]) * cirq.Points("d", [1, 2, 3, 4])  # type: ignore[list-item]
         ),
+        cirq.Concat(cirq.Points('a', [1.0, 2.0, 3.0]), cirq.Points('a', [4.0])),
     ],
 )
 def test_sweep_to_proto_roundtrip(sweep):
@@ -231,3 +235,17 @@ def test_run_context_to_proto(pass_out: bool) -> None:
     assert len(out.parameter_sweeps) == 1
     assert v2.sweep_from_proto(out.parameter_sweeps[0].sweep) == sweep
     assert out.parameter_sweeps[0].repetitions == 100
+
+
+@pytest.mark.parametrize(
+    'sweep',
+    [
+        (cirq.Linspace('tunits_linspace', tunits.ns, 10 * tunits.ns, 15)),  # type: ignore[arg-type]
+        (cirq.Points('tunits_points', [tunits.uV, tunits.mV])),  # type: ignore[list-item]
+        (cirq.Points('tunits_const', [tunits.MHz])),  # type: ignore[list-item]
+    ],
+)
+def test_tunits_round_trip(sweep):
+    msg = v2.sweep_to_proto(sweep)
+    recovered = v2.sweep_from_proto(msg)
+    assert sweep == recovered
