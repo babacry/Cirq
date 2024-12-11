@@ -14,17 +14,21 @@
 
 """Creates the abstraction for gauge compiling as a cirq transformer."""
 
-from typing import Callable, Tuple, Optional, Sequence, Union, List
+from typing import Callable, Dict, Tuple, Optional, Sequence, Union, List
+from itertools import count
+from dataclasses import dataclass
+
 import abc
 import itertools
 import functools
+import sympy
 
-from dataclasses import dataclass
 from attrs import frozen, field
 import numpy as np
 
 from cirq.transformers import transformer_api
 from cirq import ops, circuits
+from cirq.study import sweepable
 
 
 class Gauge(abc.ABC):
@@ -201,6 +205,93 @@ class GaugeTransformer:
                 new_moments.extend(_build_moments(right))
         return circuits.Circuit.from_moments(*new_moments)
 
+    def randomized_compiling(
+        self,
+        circuit: circuits.AbstractCircuit,
+        *,
+        N: int,
+        context: Optional[transformer_api.TransformerContext] = None,
+        prng: Optional[np.random.Generator] = None,
+    ) -> Tuple[circuits.AbstractCircuit, sweepable.Sweepable]:
+        """Generates a parameterized circuit with N sweepable parameters.
+
+        Args:
+            circuit: input circuit to be processed by gauge compiling.
+            N: number of randomized compilied circuits to be generated.
+            prng: pseudo random number generator to select gauge in a gauge cluster.
+        """
+        rng = np.random.default_rng() if prng is None else prng
+        if context is None:
+            context = transformer_api.TransformerContext(deep=False)
+        if context.deep:
+            raise ValueError('GaugeTransformer cannot be used with deep=True')
+        new_moments: List[List[ops.Operation]] = []
+        left_moments: List[List[ops.Operation]] = []
+        right_moments: List[List[ops.Operation]] = []
+        n_params = [{} for _ in range(N)]
+        symbol_count = count()
+        symbols_by_loc: Dict[Tuple[str, ops.Qid, int], Dict[str, str]] = {}
+
+        def next_symbol(gate: ops.Gate) -> Tuple[str, ...]:
+            sid = next(symbol_count)
+            return _parameterize(gate, sid)
+
+        # Isolate the 0th run and the rest of the parameterization mechanism
+        for moment_id, moment in enumerate(circuit):
+            for id_sample in range(N):
+                left_moments.clear()
+                right_moments.clear()
+                center: List[ops.Operation] = []
+                for op in moment:
+                    if isinstance(op, ops.TaggedOperation) and set(op.tags).intersection(
+                        context.tags_to_ignore
+                    ):
+                        center.append(op)
+                        continue
+                    if (
+                        op.gate is not None
+                        and len(op.qubits) == 2
+                        and isinstance(op.gate, type(ops.CZ))
+                        and op in self.target
+                    ):
+                        gauge = self.gauge_selector(rng).sample(op.gate, rng)
+                        q0, q1 = op.qubits
+                        center.append(gauge.on(q0, q1))
+                        for q, gates in zip(op.qubits, gauge.pre):
+                            left_moment: List[ops.GateOperation] = []
+                            right_moment: List[ops.GateOperation] = []
+                            for gate in gates:
+                                pre_loc = ("pre", q, moment_id)
+                                post_loc = ("post", q, moment_id)
+                                for loc in [pre_loc, post_loc]:
+                                    if not loc in symbols_by_loc:
+                                        symbols_by_loc[loc] = next_symbol(gate)
+                                # left
+                                pre_phxz, params = _convert_to_phxz_angles(
+                                    gate, symbols_by_loc[pre_loc]
+                                )
+                                n_params[id_sample].update(params)
+                                left_moment.append(pre_phxz.on(q))
+                                # right
+                                post_phxz, params = _convert_to_phxz_angles(
+                                    gate, symbols_by_loc[post_loc]
+                                )
+                                n_params[id_sample].update(params)
+                                right_moment.append(post_phxz.on(q))
+                            left_moments.append(left_moment)
+                            right_moments.append(right_moment)
+                    else:
+                        center.append(op)
+                # Only build parameterized circuit for the first run.
+                if id_sample == 0:
+                    if left_moments:
+                        new_moments.extend(_build_moments(left_moments))
+                    new_moments.append(center)
+                    if right_moments:
+                        new_moments.extend(_build_moments(right_moments))
+
+        return circuits.Circuit.from_moments(*new_moments), n_params
+
 
 def _build_moments(operation_by_qubits: List[List[ops.Operation]]) -> List[List[ops.Operation]]:
     """Builds moments from a list of operations grouped by qubits.
@@ -212,3 +303,56 @@ def _build_moments(operation_by_qubits: List[List[ops.Operation]]) -> List[List[
     for moment in itertools.zip_longest(*operation_by_qubits):
         moments.append([op for op in moment if op is not None])
     return moments
+
+
+def _parameterize(gate: ops.Gate, symbol_id: int):
+    if gate.num_qubits() == 1:
+        phased_xz_params = {
+            "x_exponent": sympy.Symbol(f"x{symbol_id}"),
+            "z_exponent": sympy.Symbol(f"z{symbol_id}"),
+            "axis_phase_exponent": sympy.Symbol(f"a{symbol_id}"),
+        }
+        return phased_xz_params
+    else:
+        raise NotImplementedError(
+            "parameterization for non single qubit gates is not supported yet"
+        )
+
+
+def _convert_to_phxz_angles(gate: ops.Gate, xza_by_symbols: Dict[str, str]) -> sweepable.Sweepable:
+    # # Check Identity gate.
+    # from cirq.protocols import unitary_protocol
+    # from cirq.protocols.has_unitary_protocol import has_unitary
+    # from cirq.transformers.analytical_decompositions import single_qubit_decompositions
+    # if not has_unitary(gate):
+    #     return {}
+    # phxz = single_qubit_decompositions.single_qubit_matrix_to_phxz(gate.unitary(unitary_protocol.unitary(gate)))
+    # return {xza_by_symbols["x_exponent"]: phxz.x_exponent, xza_by_symbols["z_exponent"]: 0.0, xza_by_symbols["axis_phase"]: 0.0}
+    # TODO: Rewrite the hardcoded conversion for Pauli gates, instead, support all single qubit gates.
+    match gate:
+        case ops.X:
+            return ops.PhasedXZGate(**xza_by_symbols), {
+                str(xza_by_symbols["x_exponent"]): 1.0,
+                str(xza_by_symbols["z_exponent"]): 0.0,
+                str(xza_by_symbols["axis_phase_exponent"]): 0.0,
+            }
+        case ops.Y:
+            return ops.PhasedXZGate(**xza_by_symbols), {
+                str(xza_by_symbols["x_exponent"]): 1.0,
+                str(xza_by_symbols["z_exponent"]): 1.0,
+                str(xza_by_symbols["axis_phase_exponent"]): 0.5,
+            }
+        case ops.Z:
+            return ops.PhasedXZGate(**xza_by_symbols), {
+                str(xza_by_symbols["x_exponent"]): 0.0,
+                str(xza_by_symbols["z_exponent"]): 1.0,
+                str(xza_by_symbols["axis_phase_exponent"]): 0.0,
+            }
+        case ops.I:
+            return ops.PhasedXZGate(**xza_by_symbols), {
+                str(xza_by_symbols["x_exponent"]): 0.0,
+                str(xza_by_symbols["z_exponent"]): 0.0,
+                str(xza_by_symbols["axis_phase_exponent"]): 0.0,
+            }
+        case _:
+            raise ValueError(f"Unsupported gate type: {type(gate)}")
