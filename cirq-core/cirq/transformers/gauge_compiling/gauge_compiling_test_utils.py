@@ -26,6 +26,7 @@ class GaugeTester:
 
     two_qubit_gate: cirq.Gate
     gauge_transformer: GaugeTransformer
+    test_randomized_compiling: bool = False
     must_fail: bool = False
 
     @pytest.mark.parametrize(
@@ -53,6 +54,18 @@ class GaugeTester:
             cirq.testing.assert_circuits_have_same_unitary_given_final_permutation(
                 nc, c, qubit_map={q: q for q in c.all_qubits()}
             )
+
+        # Test randomized compiling
+        if self.test_randomized_compiling:
+            c.append(cirq.Moment([cirq.measure(q) for q in c.all_qubits()]))
+            N_samples = 5
+            randomized_compiled_circuit, N_params = self.gauge_transformer.randomized_compiling(
+                c, N=N_samples, prng=np.random.default_rng(transformation_seed)
+            )
+            assert cirq.is_parameterized(randomized_compiled_circuit)
+            simulator = cirq.Simulator()
+            results = simulator.run_sweep(randomized_compiled_circuit, N_params)
+            assert len(results) == N_samples
 
     @patch('cirq.transformers.gauge_compiling.gauge_compiling._select', autospec=True)
     @pytest.mark.parametrize('seed', range(5))
