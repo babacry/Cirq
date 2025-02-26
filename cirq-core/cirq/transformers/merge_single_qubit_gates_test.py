@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sympy
 from typing import List
 
 import cirq
+from cirq.transformers.merge_single_qubit_gates import merge_into_symbolized_phxz
 
 
 def assert_optimizes(optimized: cirq.AbstractCircuit, expected: cirq.AbstractCircuit):
@@ -231,3 +233,30 @@ def test_merge_single_qubit_moments_to_phased_x_and_z_global_phase():
     c = cirq.Circuit(cirq.GlobalPhaseGate(1j).on())
     c2 = cirq.merge_single_qubit_gates_to_phased_x_and_z(c)
     assert c == c2
+
+
+def test_merge_single_qubit_gates_to_phxz_symbolized():
+    a, b = cirq.LineQubit.range(2)
+    sx = sympy.Symbol("x")
+    sa = sympy.Symbol("a")
+    sz = sympy.Symbol("z")
+    c = cirq.Circuit(
+        cirq.X(a),
+        cirq.Y(b) ** 0.5,
+        cirq.CZ(a, b),
+        cirq.H(a),
+        cirq.X(a),
+        cirq.PhasedXZGate(x_exponent=sx, axis_phase_exponent=sa, z_exponent=sz)(a),
+        cirq.H(a).with_classical_controls("m"),
+    )
+    assert_optimizes(
+        optimized=merge_into_symbolized_phxz(c),
+        expected=cirq.Circuit(
+            _phxz(-1, 1, 0).on(a),
+            _phxz(0.5, 0.5, 0).on(b),
+            cirq.CZ(a, b),
+            _phxz(-0.5, 0.5, 0).on(a),
+            cirq.measure(b, key="m"),
+            cirq.H(a).with_classical_controls("m"),
+        ),
+    )
