@@ -980,7 +980,9 @@ class PauliString(raw_types.Operation, Generic[TKey]):
         # Initialize the ps the same as self.
         ps = PauliString(qubit_pauli_map=self._qubit_pauli_map, coefficient=self.coefficient)
         all_ops = list(op_tree.flatten_to_ops(clifford))
-        all_qubits = set.union(set(self.qubits), [q for op in all_ops for q in op.qubits])
+        all_qubits: set[TKey] = set.union(
+            set(self.qubits), [q for op in all_ops for q in op.qubits]
+        )
 
         # Iteratively calculate the conjugation in reverse order of ops.
         for op in all_ops[::-1]:
@@ -989,11 +991,9 @@ class PauliString(raw_types.Operation, Generic[TKey]):
             # Then the conjugation = (C^{-1}⊗I·Pc⊗R·C⊗I) = (C^{-1}·Pc·C)⊗R.
 
             # Isolate R
-            remain: 'cirq.PauliString' = PauliString()
-            for q in all_qubits:
-                pauli = ps.get(q)
-                if pauli is not None and not q in op.qubits:
-                    remain *= pauli(q)
+            remain: 'cirq.PauliString' = PauliString(
+                *(pauli(q) for q in all_qubits - set(op.qubits) if (pauli := ps.get(q)) is not None)
+            )
 
             # Initialize the conjugation of Pc.
             conjugated: 'cirq.DensePauliString' = (
@@ -1020,7 +1020,7 @@ class PauliString(raw_types.Operation, Generic[TKey]):
             #   Puali X_k's conjugation is from the destabilzer table;
             #   Puali Z_k's conjugation is from the stabilzer table;
             #   Puali Y_k's conjugation is calcluated according to Y = iXZ. E.g., for the kth qubit,
-            #     C^{-1}·Y_k⊗I·C = C^{-1}·(iX_k⊗I·Z_k⊗I)·C = i (C^{-1}·X_k⊗I·C)·(C^{-1}·Z_k⊗I·C)
+            #     C^{-1}·Y_k⊗I·C = C^{-1}·(iX_k⊗I·Z_k⊗I)·C = i (C^{-1}·X_k⊗I·C)·(C^{-1}·Z_k⊗I·C).
             for qid, qubit in enumerate(op.qubits):
                 pauli = ps.get(qubit)
                 match pauli:
