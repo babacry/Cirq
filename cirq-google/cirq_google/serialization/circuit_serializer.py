@@ -15,7 +15,9 @@
 """Support for serializing and deserializing cirq_google.api.v2 protos."""
 
 from typing import Any, Dict, List, Optional
+import functools
 import warnings
+import numpy as np
 import sympy
 
 import cirq
@@ -26,6 +28,7 @@ from cirq_google.ops import (
     InternalTag,
     FSimViaModelTag,
     DynamicalDecouplingTag,
+    SYC,
 )
 from cirq_google.ops.calibration_tag import CalibrationTag
 from cirq_google.experimental.ops import CouplerPulse
@@ -35,6 +38,9 @@ from cirq_google.serialization import serializer, op_deserializer, op_serializer
 # "v2.5" refers to the most current v2.Program proto format.
 # CircuitSerializer is the dedicated serializer for the v2.5 format.
 _SERIALIZER_NAME = 'v2_5'
+
+# Package name for stimcirq
+_STIMCIRQ_MODULE = "stimcirq"
 
 
 class CircuitSerializer(serializer.Serializer):
@@ -191,7 +197,6 @@ class CircuitSerializer(serializer.Serializer):
             ValueError: If the operation cannot be serialized.
         """
         gate = op.gate
-
         if isinstance(gate, InternalGate):
             arg_func_langs.internal_gate_arg_to_proto(gate, out=msg.internalgate)
         elif isinstance(gate, cirq.XPowGate):
@@ -237,6 +242,8 @@ class CircuitSerializer(serializer.Serializer):
             arg_func_langs.float_arg_to_proto(
                 gate.duration.total_nanos(), out=msg.waitgate.duration_nanos
             )
+        elif isinstance(gate, cirq.ResetChannel):
+            arg_func_langs.arg_to_proto(gate.dimension, out=msg.resetgate.arguments['dimension'])
         elif isinstance(gate, CouplerPulse):
             arg_func_langs.float_arg_to_proto(
                 gate.hold_time.total_picos(), out=msg.couplerpulsegate.hold_time_ps
@@ -256,6 +263,30 @@ class CircuitSerializer(serializer.Serializer):
             arg_func_langs.float_arg_to_proto(
                 gate.q1_detune_mhz, out=msg.couplerpulsegate.q1_detune_mhz
             )
+        elif getattr(op, "__module__", "").startswith(_STIMCIRQ_MODULE) or getattr(
+            gate, "__module__", ""
+        ).startswith(_STIMCIRQ_MODULE):
+            # Special handling for stimcirq objects, which can be both operations and gates.
+            stimcirq_obj = (
+                op if getattr(op, "__module__", "").startswith(_STIMCIRQ_MODULE) else gate
+            )
+            if stimcirq_obj is not None and hasattr(stimcirq_obj, '_json_dict_'):
+                # All stimcirq gates currently have _json_dict_defined
+                msg.internalgate.name = type(stimcirq_obj).__name__
+                msg.internalgate.module = _STIMCIRQ_MODULE
+                if isinstance(stimcirq_obj, cirq.Gate):
+                    msg.internalgate.num_qubits = stimcirq_obj.num_qubits()
+                else:
+                    msg.internalgate.num_qubits = len(stimcirq_obj.qubits)
+
+                # Store json_dict objects in gate_args
+                for k, v in stimcirq_obj._json_dict_().items():
+                    arg_func_langs.arg_to_proto(value=v, out=msg.internalgate.gate_args[k])
+            else:
+                # New stimcirq op without a json dict has been introduced
+                raise ValueError(
+                    f'Cannot serialize stimcirq {op!r}:{type(gate)}'
+                )  # pragma: no cover
         else:
             raise ValueError(f'Cannot serialize op {op!r} of type {type(gate)}')
 
@@ -619,7 +650,16 @@ class CircuitSerializer(serializer.Serializer):
             if isinstance(theta, (int, float, sympy.Basic)) and isinstance(
                 phi, (int, float, sympy.Basic)
             ):
-                op = cirq.FSimGate(theta=theta, phi=phi)(*qubits)
+                if (
+                    isinstance(theta, float)
+                    and isinstance(phi, float)
+                    and np.isclose(theta, np.pi / 2)
+                    and np.isclose(phi, np.pi / 6)
+                    and not operation_proto.fsimgate.translate_via_model
+                ):
+                    op = SYC(*qubits)
+                else:
+                    op = cirq.FSimGate(theta=theta, phi=phi)(*qubits)
             else:
                 raise ValueError('theta and phi must be specified for FSimGate')
             if operation_proto.fsimgate.translate_via_model:
@@ -648,8 +688,32 @@ class CircuitSerializer(serializer.Serializer):
                 operation_proto.waitgate.duration_nanos, required_arg_name=None
             )
             op = cirq.WaitGate(duration=cirq.Duration(nanos=total_nanos or 0.0))(*qubits)
+        elif which_gate_type == 'resetgate':
+            dimensions_proto = operation_proto.resetgate.arguments.get('dimension', None)
+            if dimensions_proto is not None:
+                dimensions = arg_func_langs.arg_from_proto(dimensions_proto)
+            else:
+                dimensions = 2
+            if not isinstance(dimensions, int):
+                # This should always be int, if serialized from cirq.
+                raise ValueError(f"dimensions {dimensions} for ResetChannel must be an integer!")
+            op = cirq.ResetChannel(dimension=dimensions)(*qubits)
         elif which_gate_type == 'internalgate':
-            op = arg_func_langs.internal_gate_from_proto(operation_proto.internalgate)(*qubits)
+            msg = operation_proto.internalgate
+            if msg.module == _STIMCIRQ_MODULE and msg.name in _stimcirq_json_resolvers():
+                # special handling for stimcirq
+                # Use JSON resolver to instantiate the object
+                kwargs = {}
+                for k, v in msg.gate_args.items():
+                    arg = arg_func_langs.arg_from_proto(v)
+                    if arg is not None:
+                        kwargs[k] = arg
+                op = _stimcirq_json_resolvers()[msg.name](**kwargs)
+                if qubits:
+                    op = op(*qubits)
+            else:
+                # all other internal gates
+                op = arg_func_langs.internal_gate_from_proto(msg)(*qubits)
         elif which_gate_type == 'couplerpulsegate':
             gate = CouplerPulse(
                 hold_time=cirq.Duration(
@@ -743,6 +807,18 @@ class CircuitSerializer(serializer.Serializer):
         else:
             warnings.warn(f'Unknown tag {msg=}, ignoring')
             return None
+
+
+@functools.cache
+def _stimcirq_json_resolvers():
+    """Retrieves stimcirq JSON resolvers if stimcirq is installed.
+    Returns an empty dict if not installed."""
+    try:
+        import stimcirq
+
+        return stimcirq.JSON_RESOLVERS_DICT
+    except ModuleNotFoundError:  # pragma: no cover
+        return {}  # pragma: no cover
 
 
 CIRCUIT_SERIALIZER = CircuitSerializer()
